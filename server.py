@@ -6,7 +6,8 @@ import requests
 app = Flask(__name__)
 locations = {}
 signatures = {}
-position_history = []  # Historique des positions
+commands = {}
+position_history = []
 
 def geolocaliser_ip(ip):
     try:
@@ -38,17 +39,7 @@ def report():
             'model': data.get('model', 'unknown'),
             'date': datetime.now().isoformat()
         }
-        # Ajouter à l'historique
-        position_history.append({
-            'serial': serial,
-            'lat': data['lat'],
-            'lng': data['lng'],
-            'precision': data.get('precision', 0),
-            'source': data.get('source', 'agent'),
-            'model': data.get('model', 'unknown'),
-            'date': datetime.now().isoformat()
-        })
-        # Garder les 100 dernières positions
+        position_history.append(locations[serial].copy())
         if len(position_history) > 100:
             position_history.pop(0)
         return jsonify({"status": "ok", "serial": serial})
@@ -77,30 +68,45 @@ def dns_signature():
             'source': 'Signature DNS', 'last_seen': datetime.now().isoformat()
         })
         
-        # Ajouter à l'historique des positions
         position_history.append({
-            'serial': signature,
-            'lat': lat, 'lng': lng,
-            'precision': 5000,
-            'source': 'Signature DNS',
-            'model': model,
-            'date': datetime.now().isoformat()
+            'serial': signature, 'lat': lat, 'lng': lng,
+            'precision': 5000, 'source': 'Signature DNS',
+            'model': model, 'date': datetime.now().isoformat()
         })
         if len(position_history) > 100:
             position_history.pop(0)
         
-        print(f"📡 Signature: {signature} | IP: {ip_source} | {city}, {country}")
         return jsonify({"status": "ok", "signature": signature})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
 
+@app.route('/command/<serial>', methods=['POST'])
+def send_command(serial):
+    """Reçoit une commande pour un appareil (alarm, lock)"""
+    data = request.get_json()
+    action = data.get('action')
+    if action in ['alarm', 'lock']:
+        commands[serial] = {
+            'action': action,
+            'timestamp': datetime.now().isoformat()
+        }
+        return jsonify({"status": "ok", "message": f"Commande {action} envoyée"})
+    return jsonify({"status": "error"}), 400
+
+@app.route('/command/<serial>', methods=['GET'])
+def get_command(serial):
+    """L'agent vérifie s'il y a une commande en attente"""
+    if serial in commands:
+        cmd = commands.pop(serial)
+        return jsonify(cmd)
+    return jsonify({"action": "none"})
+
 @app.route('/api/positions', methods=['GET'])
 def get_positions():
-    """Retourne toutes les positions récentes pour la carte"""
     return jsonify({
         'locations': locations,
         'signatures': signatures,
-        'history': position_history[-50:]  # 50 dernières positions
+        'history': position_history[-50:]
     })
 
 @app.route('/dns/signatures', methods=['GET'])
@@ -123,7 +129,6 @@ def get_location(serial):
         return jsonify(locations[serial])
     return jsonify({"status": "not_found"}), 404
 
-# Template HTML avec carte temps réel
 HOME_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
@@ -147,9 +152,10 @@ HOME_TEMPLATE = '''
         .device-card h3 { color: #FF9500; margin-bottom: 8px; }
         .device-card p { color: #aaa; font-size: 13px; margin: 3px 0; }
         .device-card .coords { color: #34C759; font-weight: bold; }
+        .btn { padding: 10px 16px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 12px; margin: 3px; }
+        .btn-alarm { background: #FF3B30; color: white; }
+        .btn-lock { background: #FF9500; color: white; }
         .refresh { color: #FF9500; font-size: 11px; text-align: center; margin-top: 10px; }
-        .pulse { animation: pulse 2s infinite; }
-        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
     </style>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 </head>
@@ -160,63 +166,50 @@ HOME_TEMPLATE = '''
     </div>
     <div class="container">
         <div class="status-bar" id="status">
-            <div class="stat"><div class="stat-number" id="agentCount">-</div><div class="stat-label">Agents actifs</div></div>
+            <div class="stat"><div class="stat-number" id="agentCount">-</div><div class="stat-label">Agents</div></div>
             <div class="stat"><div class="stat-number" id="sigCount">-</div><div class="stat-label">Signatures</div></div>
-            <div class="stat"><div class="stat-number pulse">🟢</div><div class="stat-label">En ligne</div></div>
+            <div class="stat"><div class="stat-number" style="color:#34C759;">🟢</div><div class="stat-label">En ligne</div></div>
         </div>
         <div id="map"></div>
-        <div id="devices"><div style="text-align:center;color:#aaa;padding:20px;">Chargement...</div></div>
-        <div class="refresh">🔄 Auto-refresh toutes les 30 secondes • Dernière mise à jour : <span id="lastUpdate">-</span></div>
+        <div id="devices">Chargement...</div>
+        <div class="refresh">🔄 Auto-refresh 30s • <span id="lastUpdate">-</span></div>
     </div>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
         var map = L.map('map').setView([-18.9137, 47.5361], 6);
         L.tileLayer('https://mt0.google.com/vt/lyrs=s&hl=en&x={x}&y={y}&z={z}&s=Ga', {maxZoom:22}).addTo(map);
-        
         var markers = [];
+        
+        function sendCommand(serial, action) {
+            fetch('/command/' + serial, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({action: action})
+            }).then(r => r.json()).then(d => alert(d.message));
+        }
         
         function loadData() {
             fetch('/api/positions')
                 .then(r => r.json())
                 .then(data => {
-                    // Clear old markers
                     markers.forEach(m => map.removeLayer(m));
                     markers = [];
-                    
                     var bounds = [];
                     
-                    // Afficher les locations
                     for (var serial in data.locations) {
                         var loc = data.locations[serial];
-                        var marker = L.marker([loc.lat, loc.lng])
-                            .addTo(map)
+                        L.marker([loc.lat, loc.lng]).addTo(map)
                             .bindPopup('<b>📱 ' + loc.model + '</b><br>📍 ' + loc.lat.toFixed(6) + ', ' + loc.lng.toFixed(6) + '<br>📡 ' + loc.source + ' (±' + loc.precision + 'm)<br>🕐 ' + loc.date);
                         L.circle([loc.lat, loc.lng], {color: '#34C759', fillColor: '#34C759', fillOpacity: 0.2, radius: loc.precision}).addTo(map);
-                        markers.push(marker);
                         bounds.push([loc.lat, loc.lng]);
                     }
                     
-                    // Afficher les signatures
-                    for (var sig in data.signatures) {
-                        var s = data.signatures[sig];
-                        if (s.lat && s.lng && s.ip != '127.0.0.1') {
-                            var marker = L.marker([s.lat, s.lng], {
-                                icon: L.divIcon({className: '', html: '<div style="background:#FF9500;width:14px;height:14px;border-radius:50%;border:2px solid white;"></div>'})
-                            }).addTo(map).bindPopup('<b>🔑 ' + sig + '</b><br>📍 ' + s.lat.toFixed(6) + ', ' + s.lng.toFixed(6) + '<br>🏙️ ' + s.city + ', ' + s.country + '<br>🔄 x' + s.count);
-                            markers.push(marker);
-                            bounds.push([s.lat, s.lng]);
-                        }
-                    }
-                    
-                    if (bounds.length > 0) {
-                        map.fitBounds(bounds, {padding: [50, 50]});
-                    }
+                    if (bounds.length > 0) map.fitBounds(bounds, {padding: [50, 50]});
                     
                     document.getElementById('agentCount').textContent = Object.keys(data.locations).length;
                     document.getElementById('sigCount').textContent = Object.keys(data.signatures).length;
                     document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
                     
-                    // Afficher la liste des appareils
                     var html = '';
                     for (var serial in data.locations) {
                         var loc = data.locations[serial];
@@ -226,19 +219,11 @@ HOME_TEMPLATE = '''
                         html += '<p class="coords">📍 ' + loc.lat.toFixed(6) + ', ' + loc.lng.toFixed(6) + '</p>';
                         html += '<p>📡 ' + loc.source + ' | Précision: ±' + loc.precision + 'm</p>';
                         html += '<p>🕐 ' + loc.date + '</p>';
+                        html += '<button class="btn btn-alarm" onclick="sendCommand(\'' + serial + '\',\'alarm\')">🚨 Faire sonner</button>';
+                        html += '<button class="btn btn-lock" onclick="sendCommand(\'' + serial + '\',\'lock\')">🔒 Verrouiller</button>';
                         html += '</div>';
                     }
-                    for (var sig in data.signatures) {
-                        var s = data.signatures[sig];
-                        html += '<div class="device-card" style="border-left-color: #FF9500;">';
-                        html += '<h3>🔑 ' + sig + ' <span style="font-size:11px;color:#aaa;">(Signature)</span></h3>';
-                        html += '<p>📱 ' + s.model + '</p>';
-                        if (s.lat) html += '<p class="coords">📍 ' + s.lat.toFixed(6) + ', ' + s.lng.toFixed(6) + '</p>';
-                        html += '<p>🏙️ ' + s.city + ', ' + s.country + '</p>';
-                        html += '<p>🔄 Détecté x' + s.count + ' | 🕐 ' + s.last_seen + '</p>';
-                        html += '</div>';
-                    }
-                    document.getElementById('devices').innerHTML = html || '<div style="text-align:center;color:#aaa;padding:20px;">Aucun appareil</div>';
+                    document.getElementById('devices').innerHTML = html || 'Aucun appareil';
                 });
         }
         
